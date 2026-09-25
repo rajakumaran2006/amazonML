@@ -1,0 +1,12 @@
+# Ignore raw datasets (stored in test_chunk_*)
+dataset/train/
+dataset/test/
+*.tar.gz
+*.zip
+aws_part_*
+output/
+validation/
+.DS_Store
+__pycache__/
+*.pyc
+*.png

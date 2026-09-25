@@ -1,0 +1,27 @@
+{
+  "match_threshold": 0.5,
+  "singleton_cutoff": 0.4,
+  "macro_f05": 0.8592,
+  "macro_precision": 0.90707,
+  "macro_recall": 0.77855,
+  "features": [
+    "name_ratio",
+    "name_partial_ratio",
+    "name_token_sort_ratio",
+    "name_token_set_ratio",
+    "clean_name_ratio",
+    "clean_token_sort_ratio",
+    "exact_clean_match",
+    "exact_compact_match",
+    "skel_match",
+    "first_word_match",
+    "name_len_diff",
+    "name_len_ratio",
+    "addr_token_jaccard",
+    "addr_numeric_overlap",
+    "addr_numeric_exact",
+    "is_addr_missing",
+    "aux_is_s2",
+    "blocking_rank"
+  ]
+}
