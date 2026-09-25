@@ -76,6 +76,7 @@ def run_country_inference(
 
     n_total = len(s1_country_df)
     n_batches = int(np.ceil(n_total / batch_size))
+    country_assigned_aux = set()
 
     print(f"[Inference] Running inference across {n_total:,} {country_name} entities in {n_batches} batches...")
 
@@ -129,27 +130,37 @@ def run_country_inference(
                 s1_id, cand_id = pair_meta[idx]
                 s1_cand_scores[s1_id].append((cand_id, float(prob)))
 
+        # Precision-Heavy Singleton Gating & Target Uniqueness Optimization
+        batch_pairs = []
+        for s1_id, scores in s1_cand_scores.items():
+            if scores:
+                max_p = max(p for _, p in scores)
+                # If top candidate is below singleton_cutoff, entity is protected as a singleton
+                if max_p >= singleton_cutoff:
+                    for cid, p in scores:
+                        if p >= match_threshold:
+                            batch_pairs.append((p, s1_id, cid))
+
+        # Rank all pairs by confidence descending
+        batch_pairs.sort(key=lambda x: x[0], reverse=True)
+        batch_assigned = defaultdict(set)
+        for p, s1_id, cid in batch_pairs:
+            if cid not in country_assigned_aux:
+                country_assigned_aux.add(cid)
+                batch_assigned[s1_id].add(cid)
+
         # Output Generation
         for row in batch_df.itertuples(index=False):
             s1_id = row.entity_id
             all_cands = cand_dict.get(s1_id, set())
-            cand_scores = s1_cand_scores.get(s1_id, [])
+            final_matches = batch_assigned.get(s1_id, set())
 
             # Write candidate pairs
             cand_str = ",".join(sorted(all_cands)) if all_cands else ""
             candidate_f.write(f"{s1_id}\t{cand_str}\n")
 
-            # Write matching results (with Singleton Gate & Match Threshold)
-            if not cand_scores:
-                match_str = ""
-            else:
-                max_p = max(p for _, p in cand_scores)
-                if max_p < singleton_cutoff:
-                    match_str = ""
-                else:
-                    matches = [cid for cid, p in cand_scores if p >= match_threshold]
-                    match_str = ",".join(sorted(set(matches)))
-
+            # Write matching results (empty string for singletons, sorted comma-separated for matches)
+            match_str = ",".join(sorted(final_matches)) if final_matches else ""
             matching_f.write(f"{s1_id}\t{match_str}\n")
 
         batch_time = time.time() - tb0
