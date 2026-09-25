@@ -59,7 +59,7 @@ def run_country_inference(
     singleton_cutoff: float,
     matching_f,
     candidate_f,
-    batch_size: int = 50000,
+    batch_size: int = 25000,
 ):
     """
     Constructs blocking index, generates candidates, extracts features,
@@ -68,16 +68,16 @@ def run_country_inference(
     t_start = time.time()
     country_name = s1_country_df["country"].iloc[0]
 
-    # 1. Build Multi-Index Blocker
+    # 1. Build Multi-Index Blocker (with posting cap to prevent memory thrashing)
     t0 = time.time()
-    blocker = MultiIndexBlocker(max_candidates_per_entity=35)
+    blocker = MultiIndexBlocker(max_candidates_per_entity=35, max_posting=250)
     blocker.build_auxiliary_index(aux_records)
     print(f"[Blocking Index] Built index for {country_name} in {time.time() - t0:.1f}s.")
 
     n_total = len(s1_country_df)
     n_batches = int(np.ceil(n_total / batch_size))
 
-    print(f"[Inference] Running inference across {n_total} {country_name} entities in {n_batches} batches...")
+    print(f"[Inference] Running inference across {n_total:,} {country_name} entities in {n_batches} batches...")
 
     for b_idx in range(n_batches):
         tb0 = time.time()
@@ -85,12 +85,12 @@ def run_country_inference(
         b_end = min(b_start + batch_size, n_total)
         batch_df = s1_country_df.iloc[b_start:b_end]
 
-        # Preprocess batch S1
+        # Fast S1 Preprocessing using itertuples
         s1_records = {}
-        for _, row in batch_df.iterrows():
-            sid = row["entity_id"]
-            name = str(row["business_name"])
-            addr = str(row["business_address"]) if pd.notna(row["business_address"]) else ""
+        for row in batch_df.itertuples(index=False):
+            sid = row.entity_id
+            name = str(row.business_name) if pd.notna(row.business_name) else ""
+            addr = str(row.business_address) if pd.notna(row.business_address) else ""
             c_name = clean_business_name(name)
             addr_words, addr_nums = extract_address_tokens(addr)
             s1_records[sid] = {
@@ -102,7 +102,7 @@ def run_country_inference(
                 "skel": phonetic_skeleton(c_name),
                 "addr_tokens": set(addr_words),
                 "addr_nums": addr_nums,
-                "country": str(row["country"]).strip(),
+                "country": str(row.country).strip(),
             }
 
         # Candidate Generation
@@ -130,8 +130,8 @@ def run_country_inference(
                 s1_cand_scores[s1_id].append((cand_id, float(prob)))
 
         # Output Generation
-        for _, row in batch_df.iterrows():
-            s1_id = row["entity_id"]
+        for row in batch_df.itertuples(index=False):
+            s1_id = row.entity_id
             all_cands = cand_dict.get(s1_id, set())
             cand_scores = s1_cand_scores.get(s1_id, [])
 
@@ -158,7 +158,7 @@ def run_country_inference(
         eta_min = (remaining_records / rate) / 60.0 if rate > 0 else 0.0
 
         print(
-            f"  Batch {b_idx + 1}/{n_batches} ({b_end}/{n_total}) | "
+            f"  Batch {b_idx + 1}/{n_batches} ({b_end:,}/{n_total:,}) | "
             f"Pairs scored: {len(X_rows):,} | "
             f"Speed: {rate:.0f} entities/s | "
             f"ETA for {country_name}: {eta_min:.1f}m"

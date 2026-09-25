@@ -12,6 +12,7 @@ Enforces:
 """
 
 import os
+import time
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 import pandas as pd
@@ -34,8 +35,9 @@ COMMON_STOPWORDS = {
 
 
 class MultiIndexBlocker:
-    def __init__(self, max_candidates_per_entity: int = 40):
+    def __init__(self, max_candidates_per_entity: int = 40, max_posting: int = 250):
         self.max_candidates = max_candidates_per_entity
+        self.max_posting = max_posting
         self.exact_name_index = defaultdict(list)
         self.compact_name_index = defaultdict(list)
         self.token_index = defaultdict(list)
@@ -46,10 +48,14 @@ class MultiIndexBlocker:
 
     def build_auxiliary_index(self, aux_records: List[Dict]):
         """
-        Indexes all auxiliary (S2 and S3) records into multi-channel hash tables.
+        Indexes all auxiliary (S2 and S3) records into lightweight multi-channel hash tables.
+        Memory-efficient: avoids heavy n-gram sets and caps high-frequency posting lists.
         """
-        print(f"Building multi-channel inverted index over {len(aux_records)} auxiliary records...")
-        for r in aux_records:
+        total = len(aux_records)
+        print(f"Building optimized multi-channel inverted index over {total} auxiliary records...")
+        t0 = time.time()
+        
+        for idx, r in enumerate(aux_records):
             eid = r["entity_id"]
             country = str(r.get("country", "")).strip()
             name = str(r.get("business_name", ""))
@@ -61,48 +67,52 @@ class MultiIndexBlocker:
             tokens = set(clean_name.split())
             first_word = clean_name.split()[0] if clean_name.split() else ""
             skel = phonetic_skeleton(clean_name)
-            first_skel = phonetic_skeleton(first_word) if first_word else ""
 
-            record_info = {
+            # Store only fields strictly required by feature extraction
+            self.aux_records[eid] = {
                 "id": eid,
                 "country": country,
                 "name": name,
                 "clean_name": clean_name,
                 "compact_name": compact_name,
-                "addr_nums": addr_nums,
-                "tokens": tokens,
                 "first_word": first_word,
                 "skel": skel,
-                "first_skel": first_skel,
-                "ngrams": get_character_ngrams(clean_name, n=3),
+                "tokens": tokens,
+                "addr_tokens": set(addr_words),
+                "addr_nums": addr_nums,
+                "has_address": bool(addr),
+                "is_addr_missing": 1.0 if not addr else 0.0,
             }
-            self.aux_records[eid] = record_info
             self.country_aux_ids[country].append(eid)
 
             # Channel 1: Exact Clean Name
-            if clean_name:
+            if clean_name and len(self.exact_name_index[(country, clean_name)]) < self.max_posting:
                 self.exact_name_index[(country, clean_name)].append(eid)
 
             # Channel 1B: Compact Name
-            if len(compact_name) >= 4:
+            if len(compact_name) >= 4 and len(self.compact_name_index[(country, compact_name)]) < self.max_posting:
                 self.compact_name_index[(country, compact_name)].append(eid)
 
-            # Channel 2: Distinctive Token Index
+            # Channel 2: Distinctive Token Index (capped to discard stop-words)
             for tok in tokens:
-                if len(tok) >= 4 and tok not in COMMON_STOPWORDS:
+                if len(tok) >= 4 and tok not in COMMON_STOPWORDS and len(self.token_index[(country, tok)]) < self.max_posting:
                     self.token_index[(country, tok)].append(eid)
 
             # Channel 3: First Word Brand Index
-            if len(first_word) >= 4 and first_word not in COMMON_STOPWORDS:
+            if len(first_word) >= 4 and first_word not in COMMON_STOPWORDS and len(self.first_word_index[(country, first_word)]) < self.max_posting:
                 self.first_word_index[(country, first_word)].append(eid)
 
             # Channel 4: Phonetic Skeleton Index
-            if len(skel) >= 3:
+            if len(skel) >= 3 and len(self.phonetic_index[(country, skel)]) < self.max_posting:
                 self.phonetic_index[(country, skel)].append(eid)
-            if len(first_skel) >= 3 and first_skel != skel:
-                self.phonetic_index[(country, first_skel)].append(eid)
 
-        print("Multi-channel inverted index successfully constructed.")
+            if (idx + 1) % 200000 == 0 or (idx + 1) == total:
+                elapsed = time.time() - t0
+                pct = ((idx + 1) / total) * 100.0
+                rate = (idx + 1) / elapsed if elapsed > 0 else 0
+                print(f"  [Index Progress] {idx + 1:,} / {total:,} records ({pct:.1f}%) in {elapsed:.1f}s ({rate:.0f} rec/s)...")
+
+        print(f"Multi-channel inverted index successfully constructed in {time.time() - t0:.1f}s.")
 
     def generate_candidates_for_s1(
         self, s1_id: str, s1_name: str, s1_addr: str, s1_country: str
@@ -148,49 +158,32 @@ class MultiIndexBlocker:
                     candidates.add(cand_id)
                 elif s1_nums and (s1_nums & cand_info["addr_nums"]):
                     candidates.add(cand_id)
-                else:
-                    intersection_len = len(s1_ngrams & cand_info["ngrams"])
-                    union_len = len(s1_ngrams | cand_info["ngrams"])
-                    if union_len > 0 and (intersection_len / union_len) >= 0.20:
-                        candidates.add(cand_id)
+                elif len(s1_tokens & cand_info["tokens"]) >= 1:
+                    candidates.add(cand_id)
 
         # Channel 3: First Word Brand Anchor
         if len(s1_first_word) >= 4 and s1_first_word not in COMMON_STOPWORDS:
             for match_id in self.first_word_index.get((s1_country, s1_first_word), []):
-                cand_info = self.aux_records[match_id]
-                if s1_nums and (s1_nums & cand_info["addr_nums"]):
-                    candidates.add(match_id)
-                else:
-                    intersection_len = len(s1_ngrams & cand_info["ngrams"])
-                    union_len = len(s1_ngrams | cand_info["ngrams"])
-                    if union_len > 0 and (intersection_len / union_len) >= 0.20:
-                        candidates.add(match_id)
+                candidates.add(match_id)
 
         # Channel 4: Phonetic Skeleton Hits
-        for sk in [s1_skel, s1_first_skel]:
-            if len(sk) >= 3:
-                for match_id in self.phonetic_index.get((s1_country, sk), []):
-                    cand_info = self.aux_records[match_id]
-                    if s1_nums and (s1_nums & cand_info["addr_nums"]):
-                        candidates.add(match_id)
-                    else:
-                        intersection_len = len(s1_ngrams & cand_info["ngrams"])
-                        union_len = len(s1_ngrams | cand_info["ngrams"])
-                        if union_len > 0 and (intersection_len / union_len) >= 0.20:
-                            candidates.add(match_id)
+        if len(s1_skel) >= 3:
+            for match_id in self.phonetic_index.get((s1_country, s1_skel), []):
+                cand_info = self.aux_records[match_id]
+                if not s1_nums or not cand_info["addr_nums"] or (s1_nums & cand_info["addr_nums"]):
+                    candidates.add(match_id)
 
-        # Cap candidates to max_candidates using ranking
+        # Fast candidate ranking and pruning to max_candidates
         cand_list = list(candidates)
         if len(cand_list) > self.max_candidates:
             def cand_rank_key(cid):
                 c_info = self.aux_records[cid]
                 tok_overlap = len(s1_tokens & c_info["tokens"])
                 num_overlap = len(s1_nums & c_info["addr_nums"])
-                exact_flag = 1 if c_info["clean_name"] == clean_name else 0
-                compact_flag = 1 if c_info["compact_name"] == compact_name else 0
-                skel_flag = 1 if c_info["skel"] == s1_skel else 0
-                ngram_overlap = len(s1_ngrams & c_info["ngrams"])
-                return (exact_flag, compact_flag, skel_flag, num_overlap, tok_overlap, ngram_overlap)
+                exact_flag = 10 if c_info["clean_name"] == clean_name else 0
+                compact_flag = 5 if c_info["compact_name"] == compact_name else 0
+                skel_flag = 3 if c_info["skel"] == s1_skel else 0
+                return (exact_flag + compact_flag + skel_flag + num_overlap * 2 + tok_overlap)
 
             cand_list.sort(key=cand_rank_key, reverse=True)
             cand_list = cand_list[: self.max_candidates]
