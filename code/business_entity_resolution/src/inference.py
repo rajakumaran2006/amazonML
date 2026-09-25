@@ -243,7 +243,7 @@ def run_full_inference(
                 singleton_cut,
                 matching_f,
                 candidate_f,
-                batch_size=50000,
+                batch_size=25000,
             )
 
             del aux_records
