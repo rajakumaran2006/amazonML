@@ -1,6 +1,6 @@
 """
 ML Challenge 2026: Business Entity Resolution
-Module: End-to-End Training, Scoring, and Macro-F0.5 Threshold Optimization
+Module: End-to-End Training V4 - Scoring and Macro-F0.5 Threshold Optimization
 """
 
 import os
@@ -26,7 +26,7 @@ from code.business_entity_resolution.src.evaluation import compute_macro_f05
 
 def train_and_evaluate_pipeline(val_dir: str = "validation"):
     print("=" * 60)
-    print("STARTING END-TO-END PIPELINE: TRAINING & F_0.5 OPTIMIZATION")
+    print("STARTING END-TO-END PIPELINE V4: TRAINING & F_0.5 OPTIMIZATION")
     print("=" * 60)
 
     # 1. Load Data
@@ -63,9 +63,9 @@ def train_and_evaluate_pipeline(val_dir: str = "validation"):
             "country": str(row["country"]).strip(),
         }
 
-    # 3. Index Auxiliary Records & Generate Candidates
+    # 3. Index Auxiliary Records with wider recall net for training
     aux_list = s2_df.to_dict("records") + s3_df.to_dict("records")
-    blocker = MultiIndexBlocker(max_candidates_per_entity=35)
+    blocker = MultiIndexBlocker(max_candidates_per_entity=150, max_posting=300)
     blocker.build_auxiliary_index(aux_list)
 
     print("Generating candidate sets...")
@@ -107,19 +107,33 @@ def train_and_evaluate_pipeline(val_dir: str = "validation"):
     X_test, y_test = X[test_indices], y[test_indices]
     print(f"Train pairs: {len(X_train)}, Holdout validation pairs: {len(X_test)}")
 
-    # 6. Train LightGBM Classifier
-    print("Training LightGBM Classifier...")
+    # 6. Train LightGBM Classifier (V4 - Precision-Optimized)
+    print("Training LightGBM V4 Classifier (1000-tree, precision-biased)...")
+    pos_count = np.sum(y_train)
+    neg_count = len(y_train) - pos_count
+    scale_pos_weight = neg_count / max(pos_count, 1)
+    print(f"  Class weight: scale_pos_weight = {scale_pos_weight:.2f}")
     model = lgb.LGBMClassifier(
-        n_estimators=300,
-        learning_rate=0.06,
-        max_depth=6,
-        num_leaves=31,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        n_estimators=1000,
+        learning_rate=0.02,
+        max_depth=8,
+        num_leaves=63,
+        min_child_samples=10,
+        subsample=0.85,
+        subsample_freq=1,
+        colsample_bytree=0.85,
+        reg_alpha=0.05,
+        reg_lambda=0.1,
+        scale_pos_weight=scale_pos_weight,
         random_state=42,
         n_jobs=-1,
+        verbose=-1,
     )
-    model.fit(X_train, y_train)
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_test, y_test)],
+        callbacks=[lgb.early_stopping(80, verbose=True), lgb.log_evaluation(100)],
+    )
 
     # Feature Importance
     importances = model.feature_importances_
@@ -153,26 +167,43 @@ def train_and_evaluate_pipeline(val_dir: str = "validation"):
     best_single_cut = 0.5
     best_results = None
 
-    threshold_grid = [0.50, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
-    single_cut_grid = [0.40, 0.50, 0.60, 0.70]
+    threshold_grid = [0.80, 0.85, 0.88, 0.90, 0.92, 0.94, 0.96, 0.98, 0.99]
+    single_cut_grid = [0.60, 0.70, 0.80, 0.85, 0.90, 0.92, 0.94, 0.96, 0.98]
 
     for thresh in threshold_grid:
         for single_cut in single_cut_grid:
-            pred_dict = {}
+            all_pairs = []
+            
             for s1_id in test_s1:
                 cand_probs = holdout_predictions_by_s1[s1_id]
                 if not cand_probs:
-                    pred_dict[s1_id] = set()
                     continue
 
-                max_p = max(p for _, p in cand_probs)
-                if max_p < single_cut:
-                    # Singleton Gate: predict empty
+                cand_probs.sort(key=lambda x: x[1], reverse=True)
+                max_p = cand_probs[0][1]
+                
+                if max_p >= single_cut:
+                    # Guarantee at least the top candidate is assigned
+                    best_cid = cand_probs[0][0]
+                    all_pairs.append((max_p, s1_id, best_cid))
+                    
+                    # Any additional matches must pass the strict multi-match threshold
+                    for cid, p in cand_probs[1:]:
+                        if p >= thresh:
+                            all_pairs.append((p, s1_id, cid))
+                            
+            all_pairs.sort(key=lambda x: x[0], reverse=True)
+            assigned_aux = set()
+            pred_dict = defaultdict(set)
+            
+            for p, s1_id, cid in all_pairs:
+                if cid not in assigned_aux:
+                    assigned_aux.add(cid)
+                    pred_dict[s1_id].add(cid)
+                    
+            for s1_id in test_s1:
+                if s1_id not in pred_dict:
                     pred_dict[s1_id] = set()
-                else:
-                    # Accept candidates meeting match threshold
-                    matches = {cid for cid, p in cand_probs if p >= thresh}
-                    pred_dict[s1_id] = matches
 
             # Evaluate on exact official competition metric
             metrics = compute_macro_f05(gt_dict, pred_dict, test_s1)
@@ -208,16 +239,25 @@ def train_and_evaluate_pipeline(val_dir: str = "validation"):
     model_path = os.path.join(model_dir, "model.joblib")
     config_path = os.path.join(model_dir, "model_config.json")
 
-    # Fit on all validation pairs
+    # Fit on all validation pairs with more trees (no early stopping)
+    pos_count_all = np.sum(y)
+    neg_count_all = len(y) - pos_count_all
+    spw_all = neg_count_all / max(pos_count_all, 1)
     final_model = lgb.LGBMClassifier(
-        n_estimators=350,
-        learning_rate=0.06,
-        max_depth=6,
-        num_leaves=31,
-        subsample=0.8,
-        colsample_bytree=0.8,
+        n_estimators=1200,
+        learning_rate=0.02,
+        max_depth=8,
+        num_leaves=63,
+        min_child_samples=10,
+        subsample=0.85,
+        subsample_freq=1,
+        colsample_bytree=0.85,
+        reg_alpha=0.05,
+        reg_lambda=0.1,
+        scale_pos_weight=spw_all,
         random_state=42,
         n_jobs=-1,
+        verbose=-1,
     )
     final_model.fit(X, y)
     joblib.dump(final_model, model_path)

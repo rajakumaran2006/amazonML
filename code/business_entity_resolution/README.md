@@ -1,9 +1,11 @@
 # Business Entity Resolution Solution
+
 ## ML Challenge 2026
 
 This package contains the complete, self-contained, reproducible pipeline for the Business Entity Resolution Challenge.
 
 ### System Architecture
+
 1. **Linguistic Normalization (`preprocess.py`)**:
    - Strips legal suffixes across US (`Inc`, `Corp`, `LLC`), India (`Pvt Ltd`), and France (`SARL`, `SAS`, `SA`).
    - Normalizes roadway abbreviations and extracts numeric building/postal PIN tokens.
@@ -26,25 +28,32 @@ This package contains the complete, self-contained, reproducible pipeline for th
 ### End-to-End Reproduction Instructions
 
 #### 1. Setup Environment
+
 ```bash
 pip install -r requirements.txt
 ```
 
 #### 2. Train Model and Optimize Thresholds
+
 ```bash
 python3 code/business_entity_resolution/src/train_model.py
 ```
+
 Outputs `model.joblib` and `model_config.json`.
 
 #### 3. Run Inference on Test Set
+
 ```bash
 python3 code/business_entity_resolution/src/inference.py --test-dir dataset/test --output-dir output
 ```
+
 Generates:
+
 - `output/matching_results.tsv`
 - `output/candidate_pairs.tsv`
 
 #### 4. Validate Submission
+
 ```bash
 python3 utils/validate_submission.py \
     --matching output/matching_results.tsv \
@@ -52,4 +61,5 @@ python3 utils/validate_submission.py \
     --test-dir dataset/test \
     --check-ids
 ```
+
 Prints `PASS — no blocking issues found. Safe to submit.`

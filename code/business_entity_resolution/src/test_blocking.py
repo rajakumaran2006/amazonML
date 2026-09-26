@@ -34,7 +34,7 @@ def run_blocking_benchmark(val_dir: str = "validation"):
 
     # 3. Build Index
     t0 = time.time()
-    blocker = MultiIndexBlocker(max_candidates_per_entity=40)
+    blocker = MultiIndexBlocker(max_candidates_per_entity=150)
     blocker.build_auxiliary_index(aux_records)
     t_index = time.time() - t0
     print(f"Index built in {t_index:.2f} seconds.")

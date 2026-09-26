@@ -18,10 +18,12 @@ import sys
 import time
 import json
 import argparse
+from collections import defaultdict
 from typing import Dict, List, Set, Tuple
 import pandas as pd
 import numpy as np
 import joblib
+from joblib import Parallel, delayed
 
 sys.path.insert(0, ".")
 from code.business_entity_resolution.src.preprocess import (
@@ -70,13 +72,15 @@ def run_country_inference(
 
     # 1. Build Multi-Index Blocker (with posting cap to prevent memory thrashing)
     t0 = time.time()
-    blocker = MultiIndexBlocker(max_candidates_per_entity=35, max_posting=250)
+    blocker = MultiIndexBlocker(max_candidates_per_entity=150, max_posting=250)
     blocker.build_auxiliary_index(aux_records)
     print(f"[Blocking Index] Built index for {country_name} in {time.time() - t0:.1f}s.")
 
     n_total = len(s1_country_df)
     n_batches = int(np.ceil(n_total / batch_size))
-    country_assigned_aux = set()
+    
+    all_country_pairs = []
+    all_cands_dict = {}
 
     print(f"[Inference] Running inference across {n_total:,} {country_name} entities in {n_batches} batches...")
 
@@ -109,16 +113,29 @@ def run_country_inference(
         # Candidate Generation
         cand_dict = blocker.batch_generate_candidates(batch_df)
 
-        # Feature Extraction
-        X_rows = []
-        pair_meta = []  # (s1_id, cand_id)
-
+        # Feature Extraction — Parallel across CPU cores for 3-4x speedup
+        pair_list = []
         for s1_id, cands in cand_dict.items():
             s1_rec = s1_records[s1_id]
             for rank, cand_id in enumerate(cands):
-                aux_rec = blocker.aux_records[cand_id]
-                feats = extract_pair_features(s1_rec, aux_rec, rank=rank)
-                X_rows.append(feats)
+                pair_list.append((s1_id, cand_id, s1_rec, blocker.aux_records[cand_id], rank))
+
+        def _extract_one(s1_id, cand_id, s1_rec, aux_rec, rank):
+            return s1_id, cand_id, extract_pair_features(s1_rec, aux_rec, rank=rank)
+
+        n_cores = min(os.cpu_count() or 1, 8)  # cap at 8 to avoid overhead
+        if len(pair_list) > 5000 and n_cores > 1:
+            results = Parallel(n_jobs=n_cores, prefer="threads")(
+                delayed(_extract_one)(s1_id, cand_id, s1_rec, aux_rec, rank)
+                for s1_id, cand_id, s1_rec, aux_rec, rank in pair_list
+            )
+            pair_meta = [(s1_id, cand_id) for s1_id, cand_id, _ in results]
+            X_rows = [feats for _, _, feats in results]
+        else:
+            X_rows = []
+            pair_meta = []
+            for s1_id, cand_id, s1_rec, aux_rec, rank in pair_list:
+                X_rows.append(extract_pair_features(s1_rec, aux_rec, rank=rank))
                 pair_meta.append((s1_id, cand_id))
 
         # Model Scoring
@@ -130,38 +147,29 @@ def run_country_inference(
                 s1_id, cand_id = pair_meta[idx]
                 s1_cand_scores[s1_id].append((cand_id, float(prob)))
 
-        # Precision-Heavy Singleton Gating & Target Uniqueness Optimization
-        batch_pairs = []
+        # Precision-Heavy Singleton Gating & Target Uniqueness Collection
         for s1_id, scores in s1_cand_scores.items():
             if scores:
-                max_p = max(p for _, p in scores)
+                scores.sort(key=lambda x: x[1], reverse=True)
+                max_p = scores[0][1]
+                
                 # If top candidate is below singleton_cutoff, entity is protected as a singleton
                 if max_p >= singleton_cutoff:
-                    for cid, p in scores:
+                    # Guarantee at least the top candidate is assigned
+                    best_cid = scores[0][0]
+                    all_country_pairs.append((max_p, s1_id, best_cid))
+                    
+                    # Any additional matches must pass the strict multi-match threshold
+                    for cid, p in scores[1:]:
                         if p >= match_threshold:
-                            batch_pairs.append((p, s1_id, cid))
+                            all_country_pairs.append((p, s1_id, cid))
 
-        # Rank all pairs by confidence descending
-        batch_pairs.sort(key=lambda x: x[0], reverse=True)
-        batch_assigned = defaultdict(set)
-        for p, s1_id, cid in batch_pairs:
-            if cid not in country_assigned_aux:
-                country_assigned_aux.add(cid)
-                batch_assigned[s1_id].add(cid)
-
-        # Output Generation
+        # Output Candidate Pairs immediately to save memory
         for row in batch_df.itertuples(index=False):
             s1_id = row.entity_id
             all_cands = cand_dict.get(s1_id, set())
-            final_matches = batch_assigned.get(s1_id, set())
-
-            # Write candidate pairs
             cand_str = ",".join(sorted(all_cands)) if all_cands else ""
             candidate_f.write(f"{s1_id}\t{cand_str}\n")
-
-            # Write matching results (empty string for singletons, sorted comma-separated for matches)
-            match_str = ",".join(sorted(final_matches)) if final_matches else ""
-            matching_f.write(f"{s1_id}\t{match_str}\n")
 
         batch_time = time.time() - tb0
         rate = len(batch_df) / batch_time
@@ -174,6 +182,24 @@ def run_country_inference(
             f"Speed: {rate:.0f} entities/s | "
             f"ETA for {country_name}: {eta_min:.1f}m"
         )
+
+    # 4. Global Target Uniqueness Conflict Resolution
+    print("  [Global Resolution] Resolving target conflicts globally across country...")
+    country_assigned_aux = set()
+    final_assigned = defaultdict(set)
+            
+    all_country_pairs.sort(key=lambda x: x[0], reverse=True)
+    for p, s1_id, cid in all_country_pairs:
+        if cid not in country_assigned_aux:
+            country_assigned_aux.add(cid)
+            final_assigned[s1_id].add(cid)
+            
+    print("  [Global Resolution] Writing matching results...")
+    for row in s1_country_df.itertuples(index=False):
+        s1_id = row.entity_id
+        final_matches = final_assigned.get(s1_id, set())
+        match_str = ",".join(sorted(final_matches)) if final_matches else ""
+        matching_f.write(f"{s1_id}\t{match_str}\n")
 
     print(f"[Country Complete] {country_name} finished in {(time.time() - t_start) / 60:.2f} minutes.")
 
@@ -243,7 +269,7 @@ def run_full_inference(
                 singleton_cut,
                 matching_f,
                 candidate_f,
-                batch_size=25000,
+                batch_size=40000,  # Larger batches = less per-batch overhead
             )
 
             del aux_records
